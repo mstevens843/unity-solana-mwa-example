@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using UnityEngine;
 using Solana.Unity.SDK;
@@ -10,6 +11,12 @@ public class MWAManager : MonoBehaviour
 {
     private const string TAG = "[MWAManager]";
 
+    // Wallet type IDs (from godot-solana-sdk WalletAdapterUI)
+    public const int WALLET_PHANTOM = 20;
+    public const int WALLET_SOLFLARE = 25;
+    public const int WALLET_BACKPACK = 36;
+    public const int WALLET_JUPITER = 40;
+
     public static MWAManager Instance { get; private set; }
 
     public event Action<string> OnAuthorized;
@@ -18,10 +25,13 @@ public class MWAManager : MonoBehaviour
     public event Action<string> OnStatusUpdated;
 
     public string ConnectedPubkey { get; private set; } = "";
+    public int ConnectedWalletType { get; private set; } = -1;
     public string AuthToken { get; private set; } = "";
     public bool IsConnected { get; private set; } = false;
 
     public IMwaAuthCache Cache { get; set; }
+
+    private readonly HashSet<string> _deletedPubkeys = new();
 
     private void Awake()
     {
@@ -37,50 +47,102 @@ public class MWAManager : MonoBehaviour
         DontDestroyOnLoad(gameObject);
 
         Cache = new AuthCache();
-        Debug.Log($"{TAG} Awake | DONE singleton established, cache initialized");
-        Debug.Log($"{TAG} Awake | platform={Application.platform} version={Application.version} app={AppConfig.AppName} cluster={AppConfig.Cluster}");
+
+        if (Web3.Instance != null)
+        {
+            Web3.Instance.rpcCluster = AppConfig.SdkCluster;
+            Debug.Log($"{TAG} Awake | set Web3.rpcCluster={Web3.Instance.rpcCluster} ({AppConfig.Cluster})");
+        }
+        else
+        {
+            Debug.Log($"{TAG} Awake | WARN Web3.Instance is null — cluster will be set on first Authorize");
+        }
+
+        Debug.Log($"{TAG} Awake | DONE singleton established cache_type={Cache.GetType().Name}");
+        Debug.Log($"{TAG} Awake | platform={Application.platform} version={Application.version} app={AppConfig.AppName} cluster={AppConfig.Cluster} use_os_picker={AppConfig.UseOsPicker}");
     }
 
     // ─── AUTHORIZE ───────────────────────────────────────────────────────
 
-    public async Task<bool> Authorize()
+    public async Task<bool> Authorize(int walletTypeId = -1)
     {
-        Debug.Log($"{TAG} Authorize | START is_connected={IsConnected}");
+        Debug.Log($"{TAG} Authorize | START is_connected={IsConnected} wallet_type_id={walletTypeId} ({WalletTypeName(walletTypeId)}) deleted_keys={_deletedPubkeys.Count}");
         UpdateStatus("Requesting wallet authorization...");
+
+        if (_deletedPubkeys.Count > 0)
+        {
+            Debug.Log($"{TAG} Authorize | clearing {_deletedPubkeys.Count} deleted keys (connect = clean slate)");
+            _deletedPubkeys.Clear();
+        }
 
         try
         {
-            Debug.Log($"{TAG} Authorize | calling Web3.Instance.LoginWalletAdapter()");
+            Web3.Instance.rpcCluster = AppConfig.SdkCluster;
+            Debug.Log($"{TAG} Authorize | calling LoginWalletAdapter() cluster={Web3.Instance.rpcCluster}");
             var account = await Web3.Instance.LoginWalletAdapter();
+
+            Debug.Log($"{TAG} Authorize | LoginWalletAdapter returned account={account != null} pubkey={account?.PublicKey?.Key ?? "null"}");
+
             if (account == null)
             {
-                Debug.Log($"{TAG} Authorize | FAIL account is null (user cancelled or wallet error)");
+                Debug.Log($"{TAG} Authorize | RESULT=FAIL reason=account_null");
                 UpdateStatus("Authorization cancelled");
                 OnAuthorizationFailed?.Invoke("Wallet returned null — user cancelled or wallet error");
                 return false;
             }
 
-            ConnectedPubkey = account.PublicKey.Key;
+            var pubkey = account.PublicKey.Key;
+            ConnectedPubkey = pubkey;
+            ConnectedWalletType = walletTypeId;
             AuthToken = "";
             IsConnected = true;
-            Cache.Set(ConnectedPubkey, AuthToken);
-            Debug.Log($"{TAG} Authorize | SUCCESS pubkey={ConnectedPubkey}");
-            AndroidToast.Show($"Authorized: {TruncatePubkey(ConnectedPubkey)}");
 
-            // Auto sign-in for biometric confirmation (Godot parity)
-            Debug.Log($"{TAG} Authorize | CONNECTED — chaining sign-in for biometric confirmation");
-            UpdateStatus("Confirming identity...");
-            var signInSig = await SignMessage("Sign in to MWA Unity Example App");
-            if (string.IsNullOrEmpty(signInSig))
+            Debug.Log($"{TAG} Authorize | RESULT=SUCCESS pubkey={ConnectedPubkey} pubkey_len={ConnectedPubkey.Length} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)})");
+
+            bool isSeedVault = ConnectedWalletType < 0 && !AppConfig.UseOsPicker;
+            Debug.Log($"{TAG} Authorize | sign_routing isSeedVault={isSeedVault} wallet_type={ConnectedWalletType} use_os_picker={AppConfig.UseOsPicker}");
+
+            if (isSeedVault)
             {
-                Debug.Log($"{TAG} Authorize | SIGN_IN_REJECTED — cancelling auth");
-                AndroidToast.Show("Sign-in rejected — authorization cancelled");
-                await Deauthorize();
-                OnAuthorizationFailed?.Invoke("Sign-in confirmation rejected");
-                return false;
+                var signMsg = $"Sign in to {AppConfig.AppName}";
+                Debug.Log($"{TAG} Authorize | SIGN_IN_START message=\"{signMsg}\" message_len={signMsg.Length}");
+                UpdateStatus("Confirming identity...");
+                try
+                {
+                    var signInSig = await SignMessage(signMsg);
+                    Debug.Log($"{TAG} Authorize | SIGN_IN_RESULT sig_empty={string.IsNullOrEmpty(signInSig)} sig_len={signInSig?.Length ?? 0} sig={signInSig ?? "null"}");
+                    if (!string.IsNullOrEmpty(signInSig))
+                    {
+                        AndroidToast.Show("Sign-in verified");
+                    }
+                    else
+                    {
+                        Debug.Log($"{TAG} Authorize | SIGN_IN_FAIL reason=empty_signature — rejecting");
+                        IsConnected = false;
+                        ConnectedPubkey = "";
+                        UpdateStatus("Sign-in cancelled");
+                        OnAuthorizationFailed?.Invoke("Sign-in confirmation rejected");
+                        return false;
+                    }
+                }
+                catch (Exception signEx)
+                {
+                    Debug.Log($"{TAG} Authorize | SIGN_IN_FAIL reason=exception type={signEx.GetType().Name} msg={signEx.Message}");
+                    IsConnected = false;
+                    ConnectedPubkey = "";
+                    UpdateStatus("Sign-in failed");
+                    OnAuthorizationFailed?.Invoke($"Sign-in failed: {CategorizeError(signEx)}");
+                    return false;
+                }
             }
-            Debug.Log($"{TAG} Authorize | SIGNED_IN sig={signInSig[..Math.Min(20, signInSig.Length)]}...");
-            AndroidToast.Show("Biometric sign-in verified");
+            else
+            {
+                Debug.Log($"{TAG} Authorize | SKIP_SIGN reason=not_seed_vault_or_os_picker");
+                AndroidToast.Show($"Connected via {WalletTypeName(ConnectedWalletType)}");
+            }
+
+            Cache.Set(ConnectedPubkey, AuthToken, walletType: ConnectedWalletType);
+            Debug.Log($"{TAG} Authorize | CACHED pubkey={ConnectedPubkey} auth_token_len={AuthToken.Length} wallet_type={ConnectedWalletType}");
 
             UpdateStatus($"Connected: {TruncatePubkey(ConnectedPubkey)}");
             OnAuthorized?.Invoke(ConnectedPubkey);
@@ -88,9 +150,9 @@ public class MWAManager : MonoBehaviour
         }
         catch (Exception ex)
         {
-            Debug.Log($"{TAG} Authorize | EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
-            UpdateStatus($"Authorization failed: {ex.Message}");
-            OnAuthorizationFailed?.Invoke(ex.Message);
+            Debug.Log($"{TAG} Authorize | EXCEPTION type={ex.GetType().Name} msg={ex.Message} stack={ex.StackTrace}");
+            UpdateStatus($"Authorization failed: {CategorizeError(ex)}");
+            OnAuthorizationFailed?.Invoke(CategorizeError(ex));
             return false;
         }
     }
@@ -99,63 +161,130 @@ public class MWAManager : MonoBehaviour
 
     public async Task<bool> Reauthorize()
     {
-        Debug.Log($"{TAG} Reauthorize | START");
+        Debug.Log($"{TAG} Reauthorize | START is_connected={IsConnected}");
         var cached = Cache.GetLatest();
+
+        Debug.Log($"{TAG} Reauthorize | cache_result found={cached != null} pubkey={cached?.pubkey ?? "null"} wallet_type={cached?.walletType ?? -99} token_len={cached?.authToken?.Length ?? 0}");
+
         if (cached == null)
         {
-            Debug.Log($"{TAG} Reauthorize | FAIL no cached authorization");
+            Debug.Log($"{TAG} Reauthorize | RESULT=FAIL reason=no_cached_auth");
             UpdateStatus("No cached authorization found");
             await Task.CompletedTask;
             return false;
         }
 
-        Debug.Log($"{TAG} Reauthorize | cached_pubkey={cached.pubkey} cached_token_len={cached.authToken?.Length ?? 0}");
-        UpdateStatus("Reauthorizing with cached token...");
+        var pubkey = cached.pubkey;
+        var walletType = cached.walletType;
 
-        // SDK handles token reuse internally via SolanaMobileWalletAdapter.
-        // LoginWalletAdapter() checks for cached auth and uses reauthorize path when available.
-        Debug.Log($"{TAG} Reauthorize | delegating to Authorize() (SDK handles token reuse internally)");
-        AndroidToast.Show("Reauthorizing with cached token...");
-        return await Authorize();
+        if (string.IsNullOrEmpty(pubkey))
+        {
+            Debug.Log($"{TAG} Reauthorize | RESULT=FAIL reason=cached_pubkey_empty");
+            UpdateStatus("Cached authorization invalid");
+            OnAuthorizationFailed?.Invoke("Cached pubkey is empty");
+            await Task.CompletedTask;
+            return false;
+        }
+
+        ConnectedPubkey = pubkey;
+        ConnectedWalletType = walletType;
+        AuthToken = cached.authToken ?? "";
+        IsConnected = true;
+
+        Debug.Log($"{TAG} Reauthorize | RESULT=SUCCESS pubkey={ConnectedPubkey} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)}) Web3.Wallet={Web3.Wallet != null}");
+        AndroidToast.Show($"Reconnected: {TruncatePubkey(ConnectedPubkey)}");
+        UpdateStatus($"Connected: {TruncatePubkey(ConnectedPubkey)}");
+        OnAuthorized?.Invoke(ConnectedPubkey);
+        await Task.CompletedTask;
+        return true;
     }
 
     // ─── DEAUTHORIZE ─────────────────────────────────────────────────────
 
     public async Task Deauthorize()
     {
-        Debug.Log($"{TAG} Deauthorize | START pubkey={ConnectedPubkey} is_connected={IsConnected}");
+        Debug.Log($"{TAG} Deauthorize | START pubkey={ConnectedPubkey} is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null}");
         UpdateStatus("Deauthorizing...");
 
-        Debug.Log($"{TAG} Deauthorize | calling Web3.Instance.Logout()");
         Web3.Instance.Logout();
 
         string oldPubkey = ConnectedPubkey;
         ConnectedPubkey = "";
+        ConnectedWalletType = -1;
         AuthToken = "";
         IsConnected = false;
 
-        Debug.Log($"{TAG} Deauthorize | DONE old_pubkey={oldPubkey} state_cleared=true");
+        Debug.Log($"{TAG} Deauthorize | RESULT=DONE old_pubkey={oldPubkey} state_cleared=true Web3.Wallet={Web3.Wallet != null}");
         AndroidToast.Show("Wallet disconnected — session cleared");
         UpdateStatus("Disconnected");
         OnDisconnected?.Invoke();
         await Task.CompletedTask;
     }
 
+    // ─── ENSURE WALLET SESSION ──────────────────────────────────────────
+
+    private async Task<bool> EnsureWalletSession()
+    {
+        Debug.Log($"{TAG} EnsureWalletSession | START Web3.Wallet={Web3.Wallet != null} Web3.Rpc={Web3.Rpc != null} is_connected={IsConnected}");
+
+        if (Web3.Wallet != null)
+        {
+            Debug.Log($"{TAG} EnsureWalletSession | RESULT=ALREADY_ACTIVE wallet_type={Web3.Wallet.GetType().Name}");
+            return true;
+        }
+
+        if (!IsConnected)
+        {
+            Debug.Log($"{TAG} EnsureWalletSession | RESULT=FAIL reason=not_connected");
+            return false;
+        }
+
+        UpdateStatus("Establishing wallet session...");
+
+        try
+        {
+            Web3.Instance.rpcCluster = AppConfig.SdkCluster;
+            Debug.Log($"{TAG} EnsureWalletSession | calling LoginWalletAdapter() cluster={Web3.Instance.rpcCluster}");
+            var account = await Web3.Instance.LoginWalletAdapter();
+
+            Debug.Log($"{TAG} EnsureWalletSession | LoginWalletAdapter returned account={account != null} pubkey={account?.PublicKey?.Key ?? "null"} Web3.Wallet={Web3.Wallet != null} Web3.Rpc={Web3.Rpc != null}");
+
+            if (account != null)
+            {
+                AndroidToast.Show("Wallet session established");
+                return true;
+            }
+            Debug.Log($"{TAG} EnsureWalletSession | RESULT=FAIL reason=account_null");
+        }
+        catch (Exception ex)
+        {
+            Debug.Log($"{TAG} EnsureWalletSession | RESULT=FAIL reason=exception type={ex.GetType().Name} msg={ex.Message}");
+        }
+
+        UpdateStatus("Wallet session failed — please reconnect");
+        IsConnected = false;
+        ConnectedPubkey = "";
+        ConnectedWalletType = -1;
+        OnDisconnected?.Invoke();
+        return false;
+    }
+
     // ─── SIGN MESSAGE ────────────────────────────────────────────────────
 
     public async Task<string> SignMessage(string message)
     {
-        Debug.Log($"{TAG} SignMessage | START message_len={message.Length} is_connected={IsConnected}");
+        Debug.Log($"{TAG} SignMessage | START message=\"{message}\" message_len={message.Length} is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null}");
 
-        if (!IsConnected || Web3.Wallet == null)
+        if (!IsConnected)
         {
-            Debug.Log($"{TAG} SignMessage | FAIL not connected or wallet null");
+            Debug.Log($"{TAG} SignMessage | RESULT=FAIL reason=not_connected");
             UpdateStatus("Not connected");
-            if (Web3.Wallet == null && IsConnected)
-            {
-                IsConnected = false;
-                OnDisconnected?.Invoke();
-            }
+            return "";
+        }
+
+        if (Web3.Wallet == null && !await EnsureWalletSession())
+        {
+            Debug.Log($"{TAG} SignMessage | RESULT=FAIL reason=ensure_session_failed");
             return "";
         }
 
@@ -164,24 +293,27 @@ public class MWAManager : MonoBehaviour
         try
         {
             var payload = System.Text.Encoding.UTF8.GetBytes(message);
-            Debug.Log($"{TAG} SignMessage | calling Web3.Wallet.SignMessage() payload_bytes={payload.Length}");
+            Debug.Log($"{TAG} SignMessage | calling Web3.Wallet.SignMessage() payload_bytes={payload.Length} payload_hex={BitConverter.ToString(payload).Replace("-", "").ToLower()}");
             var signatureBytes = await Web3.Wallet.SignMessage(payload);
+
+            Debug.Log($"{TAG} SignMessage | Web3.Wallet.SignMessage returned sig_null={signatureBytes == null} sig_bytes={signatureBytes?.Length ?? 0}");
+
             if (signatureBytes == null || signatureBytes.Length == 0)
             {
-                Debug.Log($"{TAG} SignMessage | FAIL empty signature returned");
+                Debug.Log($"{TAG} SignMessage | RESULT=FAIL reason=empty_signature sig_null={signatureBytes == null} sig_len={signatureBytes?.Length ?? 0}");
                 UpdateStatus("Sign message failed — empty signature");
                 return "";
             }
             var sig = Convert.ToBase64String(signatureBytes);
-            Debug.Log($"{TAG} SignMessage | SUCCESS sig_len={sig.Length} sig={sig[..Math.Min(20, sig.Length)]}...");
+            Debug.Log($"{TAG} SignMessage | RESULT=SUCCESS sig_bytes={signatureBytes.Length} sig_base64_len={sig.Length} sig_base64={sig}");
             AndroidToast.Show($"Message signed: {sig[..Math.Min(16, sig.Length)]}...");
             UpdateStatus($"Signed: {sig[..Math.Min(20, sig.Length)]}...");
             return sig;
         }
         catch (Exception ex)
         {
-            Debug.Log($"{TAG} SignMessage | EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
-            UpdateStatus($"Sign message failed: {ex.Message}");
+            Debug.Log($"{TAG} SignMessage | RESULT=EXCEPTION type={ex.GetType().Name} msg={ex.Message} stack={ex.StackTrace}");
+            UpdateStatus($"Sign message failed: {CategorizeError(ex)}");
             return "";
         }
     }
@@ -190,17 +322,18 @@ public class MWAManager : MonoBehaviour
 
     public async Task<Transaction> SignTransaction(Transaction transaction)
     {
-        Debug.Log($"{TAG} SignTransaction | START is_connected={IsConnected}");
+        Debug.Log($"{TAG} SignTransaction | START is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null} tx_null={transaction == null}");
 
-        if (!IsConnected || Web3.Wallet == null)
+        if (!IsConnected)
         {
-            Debug.Log($"{TAG} SignTransaction | FAIL not connected or wallet null");
+            Debug.Log($"{TAG} SignTransaction | RESULT=FAIL reason=not_connected");
             UpdateStatus("Not connected");
-            if (Web3.Wallet == null && IsConnected)
-            {
-                IsConnected = false;
-                OnDisconnected?.Invoke();
-            }
+            return null;
+        }
+
+        if (Web3.Wallet == null && !await EnsureWalletSession())
+        {
+            Debug.Log($"{TAG} SignTransaction | RESULT=FAIL reason=ensure_session_failed");
             return null;
         }
 
@@ -208,17 +341,17 @@ public class MWAManager : MonoBehaviour
 
         try
         {
-            Debug.Log($"{TAG} SignTransaction | calling Web3.Wallet.SignTransaction()");
+            Debug.Log($"{TAG} SignTransaction | calling Web3.Wallet.SignTransaction() blockhash={transaction.RecentBlockHash} fee_payer={transaction.FeePayer} instructions={transaction.Instructions?.Count ?? 0}");
             var signedTx = await Web3.Wallet.SignTransaction(transaction);
-            Debug.Log($"{TAG} SignTransaction | SUCCESS");
+            Debug.Log($"{TAG} SignTransaction | RESULT=SUCCESS signed_tx_null={signedTx == null}");
             AndroidToast.Show("Transaction signed successfully");
             UpdateStatus("Transaction signed");
             return signedTx;
         }
         catch (Exception ex)
         {
-            Debug.Log($"{TAG} SignTransaction | EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
-            UpdateStatus($"Sign transaction failed: {ex.Message}");
+            Debug.Log($"{TAG} SignTransaction | RESULT=EXCEPTION type={ex.GetType().Name} msg={ex.Message} stack={ex.StackTrace}");
+            UpdateStatus($"Sign transaction failed: {CategorizeError(ex)}");
             return null;
         }
     }
@@ -227,17 +360,18 @@ public class MWAManager : MonoBehaviour
 
     public async Task<string> SignAndSendTransaction(Transaction transaction)
     {
-        Debug.Log($"{TAG} SignAndSendTransaction | START is_connected={IsConnected}");
+        Debug.Log($"{TAG} SignAndSendTransaction | START is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null} tx_null={transaction == null}");
 
-        if (!IsConnected || Web3.Wallet == null)
+        if (!IsConnected)
         {
-            Debug.Log($"{TAG} SignAndSendTransaction | FAIL not connected or wallet null");
+            Debug.Log($"{TAG} SignAndSendTransaction | RESULT=FAIL reason=not_connected");
             UpdateStatus("Not connected");
-            if (Web3.Wallet == null && IsConnected)
-            {
-                IsConnected = false;
-                OnDisconnected?.Invoke();
-            }
+            return "";
+        }
+
+        if (Web3.Wallet == null && !await EnsureWalletSession())
+        {
+            Debug.Log($"{TAG} SignAndSendTransaction | RESULT=FAIL reason=ensure_session_failed");
             return "";
         }
 
@@ -245,30 +379,33 @@ public class MWAManager : MonoBehaviour
 
         try
         {
-            Debug.Log($"{TAG} SignAndSendTransaction | calling Web3.Wallet.SignAndSendTransaction()");
+            Debug.Log($"{TAG} SignAndSendTransaction | calling Web3.Wallet.SignAndSendTransaction() blockhash={transaction.RecentBlockHash} fee_payer={transaction.FeePayer} instructions={transaction.Instructions?.Count ?? 0} skipPreflight=false commitment=Confirmed");
             var result = await Web3.Wallet.SignAndSendTransaction(
                 transaction,
                 skipPreflight: false,
                 commitment: Commitment.Confirmed
             );
+
+            Debug.Log($"{TAG} SignAndSendTransaction | RPC returned successful={result.WasSuccessful} result={result.Result ?? "null"} reason={result.Reason ?? "null"} error_code={result.ServerErrorCode}");
+
             if (result.WasSuccessful)
             {
-                Debug.Log($"{TAG} SignAndSendTransaction | SUCCESS sig={result.Result}");
+                Debug.Log($"{TAG} SignAndSendTransaction | RESULT=SUCCESS tx_sig={result.Result} sig_len={result.Result.Length}");
                 AndroidToast.Show($"Transaction sent: {result.Result[..Math.Min(16, result.Result.Length)]}...", longDuration: true);
                 UpdateStatus($"Sent! Sig: {result.Result[..Math.Min(20, result.Result.Length)]}...");
                 return result.Result;
             }
             else
             {
-                Debug.Log($"{TAG} SignAndSendTransaction | RPC_FAIL reason={result.Reason}");
+                Debug.Log($"{TAG} SignAndSendTransaction | RESULT=RPC_FAIL reason={result.Reason} error_code={result.ServerErrorCode}");
                 UpdateStatus($"Send failed: {result.Reason}");
                 return "";
             }
         }
         catch (Exception ex)
         {
-            Debug.Log($"{TAG} SignAndSendTransaction | EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
-            UpdateStatus($"Sign & send failed: {ex.Message}");
+            Debug.Log($"{TAG} SignAndSendTransaction | RESULT=EXCEPTION type={ex.GetType().Name} msg={ex.Message} stack={ex.StackTrace}");
+            UpdateStatus($"Sign & send failed: {CategorizeError(ex)}");
             return "";
         }
     }
@@ -277,69 +414,177 @@ public class MWAManager : MonoBehaviour
 
     public async Task<WalletCapabilities> GetCapabilities()
     {
-        Debug.Log($"{TAG} GetCapabilities | START is_connected={IsConnected}");
-
-        if (!IsConnected)
-        {
-            Debug.Log($"{TAG} GetCapabilities | FAIL not connected");
-            UpdateStatus("Not connected");
-            await Task.CompletedTask;
-            return null;
-        }
-
+        Debug.Log($"{TAG} GetCapabilities | START is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null}");
         UpdateStatus("Querying wallet capabilities...");
 
-        // GetCapabilities is not yet exposed in Solana.Unity-SDK.
-        // Returning sensible MWA 2.0 defaults until SDK adds support.
-        Debug.Log($"{TAG} GetCapabilities | returning defaults (not yet exposed in SDK)");
-
-        var placeholder = new WalletCapabilities
+        // get_capabilities is a real MWA 2.0 non-privileged method.
+        // We implemented it in the SDK (CapabilitiesResult). Try the real call first.
+        try
         {
-            MaxTransactionsPerRequest = 10,
-            MaxMessagesPerRequest = 10,
-            SupportedTransactionVersions = new[] { "legacy", "0" }
-        };
+            Debug.Log($"{TAG} GetCapabilities | attempting real SDK get_capabilities call");
 
-        AndroidToast.Show($"Capabilities: max_txs={placeholder.MaxTransactionsPerRequest} max_msgs={placeholder.MaxMessagesPerRequest}");
-        Debug.Log($"{TAG} GetCapabilities | DONE max_txs={placeholder.MaxTransactionsPerRequest} max_msgs={placeholder.MaxMessagesPerRequest}");
-        await Task.CompletedTask;
-        return placeholder;
+            // get_capabilities opens its own MWA session (non-privileged, no auth needed)
+            var adapter = new SolanaMobileWalletAdapter(
+                new SolanaMobileWalletAdapterOptions(),
+                AppConfig.SdkCluster
+            );
+            var capsResult = await adapter.GetCapabilities();
+
+            Debug.Log($"{TAG} GetCapabilities | SDK RESULT caps_null={capsResult == null} max_txs={capsResult?.MaxTransactionsPerRequest} max_msgs={capsResult?.MaxMessagesPerRequest} versions={string.Join(",", capsResult?.SupportedTransactionVersions ?? new System.Collections.Generic.List<string>())} features={string.Join(",", capsResult?.Features ?? new System.Collections.Generic.List<string>())}");
+
+            var caps = new WalletCapabilities
+            {
+                MaxTransactionsPerRequest = capsResult?.MaxTransactionsPerRequest ?? 0,
+                MaxMessagesPerRequest = capsResult?.MaxMessagesPerRequest ?? 0,
+                SupportedTransactionVersions = capsResult?.SupportedTransactionVersions?.ToArray() ?? new[] { "legacy", "0" }
+            };
+
+            AndroidToast.Show($"Capabilities: max_txs={caps.MaxTransactionsPerRequest} max_msgs={caps.MaxMessagesPerRequest}");
+            Debug.Log($"{TAG} GetCapabilities | RESULT=SUCCESS source=SDK max_txs={caps.MaxTransactionsPerRequest} max_msgs={caps.MaxMessagesPerRequest} versions={string.Join(",", caps.SupportedTransactionVersions)}");
+            return caps;
+        }
+        catch (Exception ex)
+        {
+            Debug.Log($"{TAG} GetCapabilities | SDK call failed type={ex.GetType().Name} msg={ex.Message} — falling back to spec defaults");
+
+            // Fallback to MWA spec defaults if SDK call fails (wallet may not support it)
+            var fallback = new WalletCapabilities
+            {
+                MaxTransactionsPerRequest = 10,
+                MaxMessagesPerRequest = 10,
+                SupportedTransactionVersions = new[] { "legacy", "0" }
+            };
+
+            AndroidToast.Show("get_capabilities not supported by wallet — showing spec defaults");
+            Debug.Log($"{TAG} GetCapabilities | RESULT=FALLBACK source=spec_defaults max_txs={fallback.MaxTransactionsPerRequest} max_msgs={fallback.MaxMessagesPerRequest}");
+            return fallback;
+        }
     }
 
     // ─── DELETE ACCOUNT ──────────────────────────────────────────────────
 
-    public async Task DeleteAccount()
+    public async Task<bool> DeleteAccount()
     {
-        Debug.Log($"{TAG} DeleteAccount | START pubkey={ConnectedPubkey}");
+        Debug.Log($"{TAG} DeleteAccount | START pubkey={ConnectedPubkey} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)}) is_connected={IsConnected}");
 
-        // Require wallet confirmation via biometric sign (Seed Vault protection)
-        if (IsConnected && Web3.Wallet != null)
+        if (!IsConnected)
         {
-            UpdateStatus("Confirm deletion in wallet...");
-            Debug.Log($"{TAG} DeleteAccount | requesting wallet confirmation via SignMessage");
-            var confirmSig = await SignMessage("Confirm account deletion for MWA Example App");
-            if (string.IsNullOrEmpty(confirmSig))
-            {
-                Debug.Log($"{TAG} DeleteAccount | ABORTED user did not confirm");
-                UpdateStatus("Delete cancelled — confirmation required");
-                return;
-            }
-            Debug.Log($"{TAG} DeleteAccount | confirmed sig={confirmSig[..Math.Min(20, confirmSig.Length)]}...");
+            Debug.Log($"{TAG} DeleteAccount | RESULT=FAIL reason=not_connected");
+            UpdateStatus("Not connected");
+            return false;
         }
+
+        bool walletApproved = false;
+        string routeReason;
+
+        if (ConnectedWalletType == WALLET_SOLFLARE)
+        {
+            // Solflare: signMessage broken on MWA — re-auth for confirmation
+            routeReason = "solflare_sign_broken";
+            Debug.Log($"{TAG} DeleteAccount | ROUTE=re-auth reason={routeReason} wallet_type={ConnectedWalletType}");
+            try
+            {
+                UpdateStatus("Approve in Solflare to confirm deletion...");
+                Web3.Instance.rpcCluster = AppConfig.SdkCluster;
+                var account = await Web3.Instance.LoginWalletAdapter();
+                walletApproved = account != null;
+                Debug.Log($"{TAG} DeleteAccount | re-auth returned account={account != null} approved={walletApproved}");
+            }
+            catch (Exception ex)
+            {
+                Debug.Log($"{TAG} DeleteAccount | re-auth EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
+            }
+        }
+        else if (Web3.Wallet != null)
+        {
+            // Wallet session is live — use SignMessage so user sees approval in wallet (matches Godot)
+            routeReason = "sign_message_wallet_live";
+            var confirmMsg = $"Confirm account deletion for {AppConfig.AppName}";
+            Debug.Log($"{TAG} DeleteAccount | ROUTE=sign_message reason={routeReason} wallet_type={ConnectedWalletType} Web3.Wallet=True message=\"{confirmMsg}\"");
+            try
+            {
+                UpdateStatus("Confirm deletion in your wallet...");
+                var sig = await SignMessage(confirmMsg);
+                walletApproved = !string.IsNullOrEmpty(sig);
+                Debug.Log($"{TAG} DeleteAccount | sign_message returned sig_empty={string.IsNullOrEmpty(sig)} sig_len={sig?.Length ?? 0} approved={walletApproved}");
+            }
+            catch (Exception ex)
+            {
+                Debug.Log($"{TAG} DeleteAccount | sign_message EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
+            }
+        }
+        else
+        {
+            // No live wallet session (cache reconnect) — re-auth as fallback
+            routeReason = "no_wallet_session_reauth";
+            Debug.Log($"{TAG} DeleteAccount | ROUTE=re-auth reason={routeReason} wallet_type={ConnectedWalletType} Web3.Wallet=False");
+            try
+            {
+                UpdateStatus("Approve in your wallet to confirm deletion...");
+                Web3.Instance.rpcCluster = AppConfig.SdkCluster;
+                var account = await Web3.Instance.LoginWalletAdapter();
+                walletApproved = account != null;
+                Debug.Log($"{TAG} DeleteAccount | re-auth returned account={account != null} approved={walletApproved}");
+            }
+            catch (Exception ex)
+            {
+                Debug.Log($"{TAG} DeleteAccount | re-auth EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
+            }
+        }
+
+        Debug.Log($"{TAG} DeleteAccount | APPROVAL wallet_approved={walletApproved} route={routeReason}");
+
+        if (!walletApproved)
+        {
+            Debug.Log($"{TAG} DeleteAccount | RESULT=ABORTED reason=wallet_did_not_confirm");
+            UpdateStatus("Delete cancelled — confirmation required");
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(ConnectedPubkey))
+            _deletedPubkeys.Add(ConnectedPubkey);
+
+        Debug.Log($"{TAG} DeleteAccount | PRE_CLEANUP pubkey={ConnectedPubkey} deleted_keys={_deletedPubkeys.Count}");
 
         await Deauthorize();
         Cache.ClearAll();
-        Debug.Log($"{TAG} DeleteAccount | DONE cache cleared, session destroyed");
+
+        try { Web3.Instance.Logout(); } catch (Exception) { }
+        Debug.Log($"{TAG} DeleteAccount | RESULT=SUCCESS cache_cleared=true session_destroyed=true deleted_keys={_deletedPubkeys.Count}");
         AndroidToast.Show("Account deleted — all cached data cleared", longDuration: true);
         UpdateStatus("Account deleted — all cached data cleared");
+        return true;
     }
 
     // ─── HELPERS ─────────────────────────────────────────────────────────
+
+    private string CategorizeError(Exception ex)
+    {
+        var msg = ex.Message;
+        if (msg.Contains("AUTHORIZATION_NOT_GRANTED")) return "User denied authorization";
+        if (msg.Contains("NOT_SIGNED") || msg.Contains("USER_DECLINED")) return "User declined to sign";
+        if (msg.Contains("TOO_MANY_PAYLOADS")) return "Too many payloads for this wallet";
+        if (msg.Contains("NOT_SUPPORTED") || msg.Contains("METHOD_NOT_FOUND")) return "Operation not supported by this wallet";
+        if (msg.Contains("timeout") || msg.Contains("Timeout")) return "Wallet connection timed out";
+        return msg;
+    }
 
     public string TruncatePubkey(string pubkey)
     {
         if (string.IsNullOrEmpty(pubkey) || pubkey.Length <= 8) return pubkey ?? "";
         return pubkey[..4] + "..." + pubkey[^4..];
+    }
+
+    public static string WalletTypeName(int walletType)
+    {
+        return walletType switch
+        {
+            WALLET_PHANTOM => "Phantom",
+            WALLET_SOLFLARE => "Solflare",
+            WALLET_BACKPACK => "Backpack",
+            WALLET_JUPITER => "Jupiter",
+            _ => "Seed Vault/Other"
+        };
     }
 
     private void UpdateStatus(string message)

@@ -7,7 +7,7 @@ public interface IMwaAuthCache
 {
     CachedAuth Get(string pubkey);
     CachedAuth GetLatest();
-    void Set(string pubkey, string authToken, string walletUriBase = "");
+    void Set(string pubkey, string authToken, string walletUriBase = "", string walletName = "", int walletType = -1);
     void Clear(string pubkey);
     void ClearAll();
 }
@@ -18,6 +18,8 @@ public class CachedAuth
     public string pubkey;
     public string authToken;
     public string walletUriBase;
+    public string walletName;
+    public int walletType = -1;
     public long timestamp;
 }
 
@@ -63,15 +65,17 @@ public class AuthCache : IMwaAuthCache
         return result;
     }
 
-    public void Set(string pubkey, string authToken, string walletUriBase = "")
+    public void Set(string pubkey, string authToken, string walletUriBase = "", string walletName = "", int walletType = -1)
     {
-        Debug.Log($"{TAG} Set | START pubkey={pubkey} auth_token_len={authToken?.Length ?? 0} wallet_uri_base={walletUriBase}");
+        Debug.Log($"{TAG} Set | START pubkey={pubkey} auth_token_len={authToken?.Length ?? 0} wallet_uri_base={walletUriBase} wallet_name={walletName} wallet_type={walletType}");
 
         var cached = new CachedAuth
         {
             pubkey = pubkey,
             authToken = authToken,
             walletUriBase = walletUriBase,
+            walletName = walletName,
+            walletType = walletType,
             timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
         };
 

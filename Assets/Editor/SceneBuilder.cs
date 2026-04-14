@@ -33,9 +33,10 @@ public class SceneBuilder
         var mwaGo = new GameObject("MWAManager");
         mwaGo.AddComponent<MWAManager>();
 
-        // Web3
+        // Web3 — configure cluster so MWA sends the correct network to wallets
         var web3Go = new GameObject("Web3");
         var web3 = web3Go.AddComponent<Solana.Unity.SDK.Web3>();
+        web3.rpcCluster = AppConfig.SdkCluster;
 
         // Canvas
         var canvasGo = new GameObject("Canvas");
@@ -100,12 +101,39 @@ public class SceneBuilder
         statusGo.GetComponent<TextMeshProUGUI>().enableWordWrapping = true;
         statusGo.GetComponent<TextMeshProUGUI>().color = new Color(0.8f, 0.8f, 0.8f);
 
+        // Wallet Picker Buttons (hidden by default — shown when USE_OS_PICKER = false)
+        var seedVaultGo = CreateTMPButton(containerGo, "SeedVaultButton", "Seed Vault", new Color(0.2f, 0.5f, 0.8f));
+        seedVaultGo.GetComponent<LayoutElement>().preferredHeight = 60;
+        seedVaultGo.SetActive(false);
+
+        var phantomGo = CreateTMPButton(containerGo, "PhantomButton", "Phantom", new Color(0.4f, 0.3f, 0.9f));
+        phantomGo.GetComponent<LayoutElement>().preferredHeight = 60;
+        phantomGo.SetActive(false);
+
+        var solflareGo = CreateTMPButton(containerGo, "SolflareButton", "Solflare", new Color(0.9f, 0.5f, 0.2f));
+        solflareGo.GetComponent<LayoutElement>().preferredHeight = 60;
+        solflareGo.SetActive(false);
+
+        var jupiterGo = CreateTMPButton(containerGo, "JupiterButton", "Jupiter", new Color(0.2f, 0.8f, 0.6f));
+        jupiterGo.GetComponent<LayoutElement>().preferredHeight = 60;
+        jupiterGo.SetActive(false);
+
+        var backpackGo = CreateTMPButton(containerGo, "BackpackButton", "Backpack", new Color(0.8f, 0.3f, 0.3f));
+        backpackGo.GetComponent<LayoutElement>().preferredHeight = 60;
+        backpackGo.SetActive(false);
+
         // Attach LandingUI to Canvas and wire references
         var landingUI = canvasGo.AddComponent<LandingUI>();
         landingUI.connectButton = connectGo.GetComponent<Button>();
         landingUI.reconnectButton = reconnectGo.GetComponent<Button>();
         landingUI.titleText = titleGo.GetComponent<TextMeshProUGUI>();
+        landingUI.subtitleText = subtitleGo.GetComponent<TextMeshProUGUI>();
         landingUI.statusText = statusGo.GetComponent<TextMeshProUGUI>();
+        landingUI.seedVaultButton = seedVaultGo.GetComponent<Button>();
+        landingUI.phantomButton = phantomGo.GetComponent<Button>();
+        landingUI.solflareButton = solflareGo.GetComponent<Button>();
+        landingUI.jupiterButton = jupiterGo.GetComponent<Button>();
+        landingUI.backpackButton = backpackGo.GetComponent<Button>();
 
         // Save
         string path = "Assets/Scenes/Landing.unity";

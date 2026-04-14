@@ -1,13 +1,26 @@
 using UnityEngine;
+using Solana.Unity.SDK;
 
 /// <summary>
 /// App identity sent to wallets during MWA authorization.
-/// Attach to a GameObject or use as a ScriptableObject.
 /// </summary>
 public static class AppConfig
 {
     public const string AppName = "MWA Example App";
-    public const string AppUri = "https://example.com";
+    public const string AppUri = "https://github.com/mstevens843/unity-solana-mwa-example";
     public const string AppIconPath = "/icon.png";
-    public const string Cluster = "devnet"; // "devnet", "testnet", or "mainnet-beta"
+    public const string Cluster = "mainnet-beta"; // "devnet", "testnet", or "mainnet-beta"
+    public const bool UseOsPicker = true; // true = OS wallet picker, false = in-app wallet buttons (stores wallet type)
+
+    /// <summary>
+    /// Maps the Cluster string to the SDK's RpcCluster enum.
+    /// Used by SceneBuilder to configure the Web3 component.
+    /// </summary>
+    public static RpcCluster SdkCluster => Cluster switch
+    {
+        "mainnet-beta" => RpcCluster.MainNet,
+        "devnet" => RpcCluster.DevNet,
+        "testnet" => RpcCluster.TestNet,
+        _ => RpcCluster.MainNet
+    };
 }

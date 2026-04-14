@@ -53,3 +53,10 @@ Thumbs.db
 
 # Builds
 *.debug.symbols/
+
+# Unity recovery scenes (auto-generated crash recovery)
+Assets/_Recovery/
+Assets/_Recovery.meta
+
+# Cloned SDK (referenced via Packages/manifest.json, not committed)
+Solana.Unity-SDK/
