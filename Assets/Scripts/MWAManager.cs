@@ -51,7 +51,10 @@ public class MWAManager : MonoBehaviour
         if (Web3.Instance != null)
         {
             Web3.Instance.rpcCluster = AppConfig.SdkCluster;
-            Debug.Log($"{TAG} Awake | set Web3.rpcCluster={Web3.Instance.rpcCluster} ({AppConfig.Cluster})");
+            var mwaOpts = Web3.Instance.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions;
+            mwaOpts.siwsDomain = AppConfig.SiwsDomain;
+            mwaOpts.siwsStatement = AppConfig.SiwsStatement;
+            Debug.Log($"{TAG} Awake | set Web3.rpcCluster={Web3.Instance.rpcCluster} ({AppConfig.Cluster}) SIWS domain={mwaOpts.siwsDomain} statement={mwaOpts.siwsStatement}");
         }
         else
         {
@@ -78,7 +81,14 @@ public class MWAManager : MonoBehaviour
         try
         {
             Web3.Instance.rpcCluster = AppConfig.SdkCluster;
-            Debug.Log($"{TAG} Authorize | calling LoginWalletAdapter() cluster={Web3.Instance.rpcCluster}");
+            var mwaOpts = Web3.Instance.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions;
+            if (string.IsNullOrEmpty(mwaOpts.siwsDomain))
+            {
+                mwaOpts.siwsDomain = AppConfig.SiwsDomain;
+                mwaOpts.siwsStatement = AppConfig.SiwsStatement;
+                Debug.Log($"{TAG} Authorize | SIWS configured (late) domain={mwaOpts.siwsDomain}");
+            }
+            Debug.Log($"{TAG} Authorize | calling LoginWalletAdapter() cluster={Web3.Instance.rpcCluster} siwsDomain={mwaOpts.siwsDomain}");
             var account = await Web3.Instance.LoginWalletAdapter();
 
             Debug.Log($"{TAG} Authorize | LoginWalletAdapter returned account={account != null} pubkey={account?.PublicKey?.Key ?? "null"}");
@@ -99,45 +109,21 @@ public class MWAManager : MonoBehaviour
 
             Debug.Log($"{TAG} Authorize | RESULT=SUCCESS pubkey={ConnectedPubkey} pubkey_len={ConnectedPubkey.Length} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)})");
 
-            bool isSeedVault = ConnectedWalletType < 0 && !AppConfig.UseOsPicker;
-            Debug.Log($"{TAG} Authorize | sign_routing isSeedVault={isSeedVault} wallet_type={ConnectedWalletType} use_os_picker={AppConfig.UseOsPicker}");
+            // SIWS handles sign-in for ALL wallets at the SDK level.
+            // The SDK throws if SIWS was requested but wallet didn't return SignInResult,
+            // so reaching here means SIWS succeeded (or keepConnectionAlive returned cached pk).
+            var walletAdapter = Web3.Wallet as SolanaWalletAdapter;
+            var signInResult = walletAdapter?.LastSignInResult;
+            Debug.Log($"{TAG} Authorize | SIWS_RESULT adapter_null={walletAdapter == null} result_null={signInResult == null} address={signInResult?.Address ?? "null"} sig_type={signInResult?.SignatureType ?? "null"}");
 
-            if (isSeedVault)
+            if (signInResult != null)
             {
-                var signMsg = $"Sign in to {AppConfig.AppName}";
-                Debug.Log($"{TAG} Authorize | SIGN_IN_START message=\"{signMsg}\" message_len={signMsg.Length}");
-                UpdateStatus("Confirming identity...");
-                try
-                {
-                    var signInSig = await SignMessage(signMsg);
-                    Debug.Log($"{TAG} Authorize | SIGN_IN_RESULT sig_empty={string.IsNullOrEmpty(signInSig)} sig_len={signInSig?.Length ?? 0} sig={signInSig ?? "null"}");
-                    if (!string.IsNullOrEmpty(signInSig))
-                    {
-                        AndroidToast.Show("Sign-in verified");
-                    }
-                    else
-                    {
-                        Debug.Log($"{TAG} Authorize | SIGN_IN_FAIL reason=empty_signature — rejecting");
-                        IsConnected = false;
-                        ConnectedPubkey = "";
-                        UpdateStatus("Sign-in cancelled");
-                        OnAuthorizationFailed?.Invoke("Sign-in confirmation rejected");
-                        return false;
-                    }
-                }
-                catch (Exception signEx)
-                {
-                    Debug.Log($"{TAG} Authorize | SIGN_IN_FAIL reason=exception type={signEx.GetType().Name} msg={signEx.Message}");
-                    IsConnected = false;
-                    ConnectedPubkey = "";
-                    UpdateStatus("Sign-in failed");
-                    OnAuthorizationFailed?.Invoke($"Sign-in failed: {CategorizeError(signEx)}");
-                    return false;
-                }
+                Debug.Log($"{TAG} Authorize | SIWS_VERIFIED address={signInResult.Address} sig={signInResult.Signature ?? "null"}");
+                AndroidToast.Show("Sign-in verified (SIWS)");
             }
             else
             {
-                Debug.Log($"{TAG} Authorize | SKIP_SIGN reason=not_seed_vault_or_os_picker");
+                Debug.LogWarning($"{TAG} Authorize | SIWS_MISSING — wallet may not support SIWS or keepConnectionAlive returned cached pk");
                 AndroidToast.Show($"Connected via {WalletTypeName(ConnectedWalletType)}");
             }
 

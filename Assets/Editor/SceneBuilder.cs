@@ -37,6 +37,10 @@ public class SceneBuilder
         var web3Go = new GameObject("Web3");
         var web3 = web3Go.AddComponent<Solana.Unity.SDK.Web3>();
         web3.rpcCluster = AppConfig.SdkCluster;
+        web3.solanaWalletAdapterOptions ??= new Solana.Unity.SDK.SolanaWalletAdapterOptions();
+        web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions ??= new Solana.Unity.SDK.SolanaMobileWalletAdapterOptions();
+        web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions.siwsDomain = AppConfig.SiwsDomain;
+        web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions.siwsStatement = AppConfig.SiwsStatement;
 
         // Canvas
         var canvasGo = new GameObject("Canvas");
