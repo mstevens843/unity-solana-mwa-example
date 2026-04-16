@@ -1,7 +1,7 @@
 {
   "dependencies": {
     "com.solana.unity_sdk": {
-      "version": "file:../../Solana.Unity-SDK",
+      "version": "file:../Solana.Unity-SDK",
       "depth": 0,
       "source": "local",
       "dependencies": {

@@ -47,7 +47,8 @@ public class HomeUI : MonoBehaviour
         signMessageButton.onClick.AddListener(OnSignMessage);
         signTxButton.onClick.AddListener(OnSignTransaction);
         signSendButton.onClick.AddListener(OnSignAndSend);
-        capabilitiesButton.onClick.AddListener(OnGetCapabilities);
+        // TODO: Re-enable when SDK GetCapabilities is available
+        // capabilitiesButton.onClick.AddListener(OnGetCapabilities);
         disconnectButton.onClick.AddListener(OnDisconnect);
         if (reconnectButton != null) reconnectButton.gameObject.SetActive(false);
         deleteButton.onClick.AddListener(OnDeleteAccount);
@@ -239,6 +240,8 @@ public class HomeUI : MonoBehaviour
         SetButtonsInteractable(true);
     }
 
+    // TODO: Re-enable when SDK GetCapabilities is available on this branch
+    /*
     private async void OnGetCapabilities()
     {
         Debug.Log($"{TAG} OnGetCapabilities | START");
@@ -258,6 +261,7 @@ public class HomeUI : MonoBehaviour
         }
         SetButtonsInteractable(true);
     }
+    */
 
     private async void OnDisconnect()
     {

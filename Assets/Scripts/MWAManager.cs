@@ -109,13 +109,9 @@ public class MWAManager : MonoBehaviour
 
             Debug.Log($"{TAG} Authorize | RESULT=SUCCESS pubkey={ConnectedPubkey} pubkey_len={ConnectedPubkey.Length} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)})");
 
-            // SIWS handles sign-in for ALL wallets at the SDK level.
-            // The SDK throws if SIWS was requested but wallet didn't return SignInResult,
-            // so reaching here means SIWS succeeded (or keepConnectionAlive returned cached pk).
             var walletAdapter = Web3.Wallet as SolanaWalletAdapter;
             var signInResult = walletAdapter?.LastSignInResult;
             Debug.Log($"{TAG} Authorize | SIWS_RESULT adapter_null={walletAdapter == null} result_null={signInResult == null} address={signInResult?.Address ?? "null"} sig_type={signInResult?.SignatureType ?? "null"}");
-
             if (signInResult != null)
             {
                 Debug.Log($"{TAG} Authorize | SIWS_VERIFIED address={signInResult.Address} sig={signInResult.Signature ?? "null"}");
@@ -397,19 +393,17 @@ public class MWAManager : MonoBehaviour
     }
 
     // ─── GET CAPABILITIES ────────────────────────────────────────────────
-
+    // TODO: Re-enable when SDK GetCapabilities is available on this branch
+    /*
     public async Task<WalletCapabilities> GetCapabilities()
     {
         Debug.Log($"{TAG} GetCapabilities | START is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null}");
         UpdateStatus("Querying wallet capabilities...");
 
-        // get_capabilities is a real MWA 2.0 non-privileged method.
-        // We implemented it in the SDK (CapabilitiesResult). Try the real call first.
         try
         {
             Debug.Log($"{TAG} GetCapabilities | attempting real SDK get_capabilities call");
 
-            // get_capabilities opens its own MWA session (non-privileged, no auth needed)
             var adapter = new SolanaMobileWalletAdapter(
                 new SolanaMobileWalletAdapterOptions(),
                 AppConfig.SdkCluster
@@ -433,7 +427,6 @@ public class MWAManager : MonoBehaviour
         {
             Debug.Log($"{TAG} GetCapabilities | SDK call failed type={ex.GetType().Name} msg={ex.Message} — falling back to spec defaults");
 
-            // Fallback to MWA spec defaults if SDK call fails (wallet may not support it)
             var fallback = new WalletCapabilities
             {
                 MaxTransactionsPerRequest = 10,
@@ -446,6 +439,7 @@ public class MWAManager : MonoBehaviour
             return fallback;
         }
     }
+    */
 
     // ─── DELETE ACCOUNT ──────────────────────────────────────────────────
 
