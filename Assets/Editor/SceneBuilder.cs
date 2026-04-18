@@ -39,8 +39,9 @@ public class SceneBuilder
         web3.rpcCluster = AppConfig.SdkCluster;
         web3.solanaWalletAdapterOptions ??= new Solana.Unity.SDK.SolanaWalletAdapterOptions();
         web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions ??= new Solana.Unity.SDK.SolanaMobileWalletAdapterOptions();
-        web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions.siwsDomain = AppConfig.SiwsDomain;
-        web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions.siwsStatement = AppConfig.SiwsStatement;
+        // TEMP: SIWS options not present on feat/expose-mwa-auth-token branch
+        // web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions.siwsDomain = AppConfig.SiwsDomain;
+        // web3.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions.siwsStatement = AppConfig.SiwsStatement;
 
         // Canvas
         var canvasGo = new GameObject("Canvas");

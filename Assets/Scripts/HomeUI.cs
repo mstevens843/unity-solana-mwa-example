@@ -228,7 +228,22 @@ public class HomeUI : MonoBehaviour
             Debug.Log($"{TAG} OnSignAndSend | RESULT sig_empty={string.IsNullOrEmpty(sig)} sig={sig ?? "null"}");
 
             if (string.IsNullOrEmpty(sig))
-                statusText.text = "Sign & send failed";
+            {
+                // Branch on MWAManager.LastErrorCode so the user gets a
+                // truthful message. INSUFFICIENT_FUNDS_FOR_RENT is by far
+                // the most common non-wallet failure (Seed Vault's wrapper
+                // injects priority fees that push low-balance fee-payers
+                // below the rent-exempt minimum). See KNOWN_ISSUES.md.
+                if (_mwa.LastErrorCode == "INSUFFICIENT_FUNDS_FOR_RENT")
+                {
+                    statusText.text = $"Fee-payer underfunded — send ≥0.001 SOL to {_mwa.TruncatePubkey(_mwa.ConnectedPubkey)} and retry";
+                    AndroidToast.Show($"Fee-payer underfunded — send ≥0.001 SOL and retry", longDuration: true);
+                }
+                else
+                {
+                    statusText.text = "Sign & send failed";
+                }
+            }
             else
                 statusText.text = $"Sent! Sig:\n{sig}";
         }

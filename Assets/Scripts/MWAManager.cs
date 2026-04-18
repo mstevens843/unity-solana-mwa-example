@@ -29,6 +29,15 @@ public class MWAManager : MonoBehaviour
     public string AuthToken { get; private set; } = "";
     public bool IsConnected { get; private set; } = false;
 
+    /// <summary>
+    /// Last error code from the most recent MWA operation. Populated on
+    /// failure paths (cleared on successful call start). Lets UI branch on
+    /// specific conditions — e.g. `INSUFFICIENT_FUNDS_FOR_RENT` so we can
+    /// show a "fund the account" toast instead of a generic "send failed".
+    /// See KNOWN_ISSUES.md for the taxonomy.
+    /// </summary>
+    public string LastErrorCode { get; private set; } = "";
+
     public IMwaAuthCache Cache { get; set; }
 
     private readonly HashSet<string> _deletedPubkeys = new();
@@ -48,21 +57,25 @@ public class MWAManager : MonoBehaviour
 
         Cache = new AuthCache();
 
+        // Pass 14 note: `Web3.Instance` is typically null during Awake on cold
+        // start (Web3 MonoBehaviour hasn't finished its own Awake yet), so
+        // cluster + SIWS options must be set lazily inside `Authorize()` /
+        // `Reauthorize()` right before `LoginWalletAdapter()`. If
+        // `Web3.Instance` IS available here we still set the cluster eagerly
+        // for any code that reads it before the first Connect.
         if (Web3.Instance != null)
         {
             Web3.Instance.rpcCluster = AppConfig.SdkCluster;
-            var mwaOpts = Web3.Instance.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions;
-            mwaOpts.siwsDomain = AppConfig.SiwsDomain;
-            mwaOpts.siwsStatement = AppConfig.SiwsStatement;
-            Debug.Log($"{TAG} Awake | set Web3.rpcCluster={Web3.Instance.rpcCluster} ({AppConfig.Cluster}) SIWS domain={mwaOpts.siwsDomain} statement={mwaOpts.siwsStatement}");
+            Debug.Log($"{TAG} Awake | set Web3.rpcCluster={Web3.Instance.rpcCluster} ({AppConfig.Cluster}) — SIWS options applied in Authorize()");
         }
         else
         {
-            Debug.Log($"{TAG} Awake | WARN Web3.Instance is null — cluster will be set on first Authorize");
+            Debug.Log($"{TAG} Awake | Web3.Instance null (expected on cold start) — cluster + SIWS options applied on first Authorize()");
         }
 
         Debug.Log($"{TAG} Awake | DONE singleton established cache_type={Cache.GetType().Name}");
         Debug.Log($"{TAG} Awake | platform={Application.platform} version={Application.version} app={AppConfig.AppName} cluster={AppConfig.Cluster} use_os_picker={AppConfig.UseOsPicker}");
+        Debug.Log($"{TAG} Awake | feature_flags use_mwa_sign_and_send={AppConfig.UseMwaSignAndSend} use_siws={AppConfig.UseSiws} use_auth_cache={AppConfig.UseAuthCache}");
     }
 
     // ─── AUTHORIZE ───────────────────────────────────────────────────────
@@ -81,14 +94,32 @@ public class MWAManager : MonoBehaviour
         try
         {
             Web3.Instance.rpcCluster = AppConfig.SdkCluster;
+
+            // Pass 14 fix: apply SIWS config HERE (not in Awake()) because
+            // `Web3.Instance` is null during Awake on cold start, so the
+            // Awake-time block is a no-op — `_walletOptions.siwsDomain` stays
+            // null and `_Login` takes the LEGACY path, ignoring
+            // `AppConfig.UseSiws`. Setting the options right before
+            // `LoginWalletAdapter()` guarantees the SDK sees the current flag
+            // value every time. Non-null domain → SDK's
+            // `SolanaMobileWalletAdapter._Login` takes the SIWS path
+            // (`authorize` + `sign_in_payload`, with an in-session
+            // `sign_messages` fallback for wallets that don't return
+            // `sign_in_result` natively). Null domain → plain MWA 1.x
+            // `authorize`.
             var mwaOpts = Web3.Instance.solanaWalletAdapterOptions.solanaMobileWalletAdapterOptions;
-            if (string.IsNullOrEmpty(mwaOpts.siwsDomain))
+            if (AppConfig.UseSiws)
             {
                 mwaOpts.siwsDomain = AppConfig.SiwsDomain;
                 mwaOpts.siwsStatement = AppConfig.SiwsStatement;
-                Debug.Log($"{TAG} Authorize | SIWS configured (late) domain={mwaOpts.siwsDomain}");
             }
-            Debug.Log($"{TAG} Authorize | calling LoginWalletAdapter() cluster={Web3.Instance.rpcCluster} siwsDomain={mwaOpts.siwsDomain}");
+            else
+            {
+                mwaOpts.siwsDomain = null;
+                mwaOpts.siwsStatement = null;
+            }
+
+            Debug.Log($"{TAG} Authorize | calling LoginWalletAdapter() cluster={Web3.Instance.rpcCluster} mode={(AppConfig.UseSiws ? "siws" : "plain_authorize")} siwsDomain={mwaOpts.siwsDomain ?? "(null)"} siwsStatement={mwaOpts.siwsStatement ?? "(null)"}");
             var account = await Web3.Instance.LoginWalletAdapter();
 
             Debug.Log($"{TAG} Authorize | LoginWalletAdapter returned account={account != null} pubkey={account?.PublicKey?.Key ?? "null"}");
@@ -110,21 +141,38 @@ public class MWAManager : MonoBehaviour
             Debug.Log($"{TAG} Authorize | RESULT=SUCCESS pubkey={ConnectedPubkey} pubkey_len={ConnectedPubkey.Length} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)})");
 
             var walletAdapter = Web3.Wallet as SolanaWalletAdapter;
-            var signInResult = walletAdapter?.LastSignInResult;
-            Debug.Log($"{TAG} Authorize | SIWS_RESULT adapter_null={walletAdapter == null} result_null={signInResult == null} address={signInResult?.Address ?? "null"} sig_type={signInResult?.SignatureType ?? "null"}");
-            if (signInResult != null)
+            if (AppConfig.UseSiws)
             {
-                Debug.Log($"{TAG} Authorize | SIWS_VERIFIED address={signInResult.Address} sig={signInResult.Signature ?? "null"}");
-                AndroidToast.Show("Sign-in verified (SIWS)");
+                var signInResult = walletAdapter?.LastSignInResult;
+                Debug.Log($"{TAG} Authorize | SIWS_RESULT adapter_null={walletAdapter == null} result_null={signInResult == null} address={signInResult?.Address ?? "null"} sig_type={signInResult?.SignatureType ?? "null"}");
+                if (signInResult != null)
+                {
+                    Debug.Log($"{TAG} Authorize | SIWS_VERIFIED address={signInResult.Address} sig_len={signInResult.Signature?.Length ?? 0}");
+                    AndroidToast.Show($"Signed in with Solana: {TruncatePubkey(ConnectedPubkey)}");
+                }
+                else
+                {
+                    Debug.LogWarning($"{TAG} Authorize | SIWS_MISSING wallet didn't return sign_in_result (Phantom/Solflare degrade here)");
+                    AndroidToast.Show($"Connected via {WalletTypeName(ConnectedWalletType)}");
+                }
             }
             else
             {
-                Debug.LogWarning($"{TAG} Authorize | SIWS_MISSING — wallet may not support SIWS or keepConnectionAlive returned cached pk");
                 AndroidToast.Show($"Connected via {WalletTypeName(ConnectedWalletType)}");
             }
 
-            Cache.Set(ConnectedPubkey, AuthToken, walletType: ConnectedWalletType);
-            Debug.Log($"{TAG} Authorize | CACHED pubkey={ConnectedPubkey} auth_token_len={AuthToken.Length} wallet_type={ConnectedWalletType}");
+            // Pass 14: cache write is flag-gated. UseAuthCache=false keeps the
+            // demo SIWS/Connect flow working but skips PlayerPrefs persistence
+            // so cold-start auto-sign-in doesn't fire.
+            if (AppConfig.UseAuthCache)
+            {
+                Cache.Set(ConnectedPubkey, AuthToken, walletType: ConnectedWalletType);
+                Debug.Log($"{TAG} Authorize | CACHED pubkey={ConnectedPubkey} auth_token_len={AuthToken.Length} wallet_type={ConnectedWalletType}");
+            }
+            else
+            {
+                Debug.Log($"{TAG} Authorize | CACHE_SKIPPED UseAuthCache=false");
+            }
 
             UpdateStatus($"Connected: {TruncatePubkey(ConnectedPubkey)}");
             OnAuthorized?.Invoke(ConnectedPubkey);
@@ -143,7 +191,18 @@ public class MWAManager : MonoBehaviour
 
     public async Task<bool> Reauthorize()
     {
-        Debug.Log($"{TAG} Reauthorize | START is_connected={IsConnected}");
+        Debug.Log($"{TAG} Reauthorize | START is_connected={IsConnected} use_auth_cache={AppConfig.UseAuthCache}");
+
+        // Pass 14: when AuthCache is disabled, there's nothing to restore —
+        // Reconnect (cached) becomes a no-op that surfaces "no cached auth".
+        if (!AppConfig.UseAuthCache)
+        {
+            Debug.Log($"{TAG} Reauthorize | RESULT=FAIL reason=auth_cache_disabled");
+            UpdateStatus("Auth cache disabled — use Connect instead");
+            await Task.CompletedTask;
+            return false;
+        }
+
         var cached = Cache.GetLatest();
 
         Debug.Log($"{TAG} Reauthorize | cache_result found={cached != null} pubkey={cached?.pubkey ?? "null"} wallet_type={cached?.walletType ?? -99} token_len={cached?.authToken?.Length ?? 0}");
@@ -342,11 +401,13 @@ public class MWAManager : MonoBehaviour
 
     public async Task<string> SignAndSendTransaction(Transaction transaction)
     {
-        Debug.Log($"{TAG} SignAndSendTransaction | START is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null} tx_null={transaction == null}");
+        Debug.Log($"{TAG} SignAndSendTransaction | START is_connected={IsConnected} Web3.Wallet={Web3.Wallet != null} tx_null={transaction == null} wallet_type={ConnectedWalletType} ({WalletTypeName(ConnectedWalletType)})");
+        LastErrorCode = "";
 
         if (!IsConnected)
         {
             Debug.Log($"{TAG} SignAndSendTransaction | RESULT=FAIL reason=not_connected");
+            LastErrorCode = "NOT_CONNECTED";
             UpdateStatus("Not connected");
             return "";
         }
@@ -354,7 +415,62 @@ public class MWAManager : MonoBehaviour
         if (Web3.Wallet == null && !await EnsureWalletSession())
         {
             Debug.Log($"{TAG} SignAndSendTransaction | RESULT=FAIL reason=ensure_session_failed");
+            LastErrorCode = "NO_SESSION";
             return "";
+        }
+
+        // Pre-broadcast balance check — short-circuit when we know the
+        // fee-payer can't cover Solana's rent-exempt minimum + tx fee +
+        // priority-fee buffer. Seed Vault's Solflare-wrapper injects
+        // ComputeBudget priority-fee instructions before signing which pushes
+        // the required balance higher than a bare memo-tx fee alone. Surfaces
+        // a specific INSUFFICIENT_FUNDS_FOR_RENT code so the UI can show a
+        // truthful "fund the account" toast instead of "send failed".
+        // See KNOWN_ISSUES.md "Insufficient funds for rent".
+        const ulong RentExemptBufferLamports = 1_000_000UL; // 890_880 rent + ~5000 fee + ~100_000 priority-fee buffer
+        try
+        {
+            var balResult = await Web3.Rpc.GetBalanceAsync(Web3.Wallet.Account.PublicKey, Commitment.Confirmed);
+            ulong lamports = balResult?.Result?.Value ?? 0UL;
+            if (balResult == null || !balResult.WasSuccessful)
+            {
+                Debug.Log($"{TAG} SignAndSendTransaction | STEP_PREFLIGHT_BALANCE_UNKNOWN rpc_call_failed reason={balResult?.Reason} — proceeding anyway");
+            }
+            else if (lamports < RentExemptBufferLamports)
+            {
+                Debug.Log($"{TAG} SignAndSendTransaction | STEP_PREFLIGHT_FAIL balance={lamports} required=~{RentExemptBufferLamports} pubkey={ConnectedPubkey}");
+                LastErrorCode = "INSUFFICIENT_FUNDS_FOR_RENT";
+                UpdateStatus($"Fee-payer underfunded — send ≥0.001 SOL to {TruncatePubkey(ConnectedPubkey)} and retry");
+                return "";
+            }
+            else
+            {
+                Debug.Log($"{TAG} SignAndSendTransaction | STEP_PREFLIGHT_BALANCE_OK balance={lamports} threshold={RentExemptBufferLamports}");
+            }
+        }
+        catch (Exception bex)
+        {
+            Debug.Log($"{TAG} SignAndSendTransaction | STEP_PREFLIGHT_BALANCE_EXCEPTION type={bex.GetType().Name} msg={bex.Message} — proceeding anyway");
+        }
+
+        // Backpack's native `sign_and_send_transactions` MWA handler crashes
+        // with a Kotlin JsonDecodingException ("Class discriminator was
+        // missing…"). Their `sign_transactions` handler works fine. Route
+        // Backpack through sign-only + our own RPC broadcast — one wallet
+        // intent, one approval, same UX as the native path.
+        // See KNOWN_ISSUES.md "Backpack sign_and_send crashes".
+        if (ConnectedWalletType == WALLET_BACKPACK)
+        {
+            return await SignAndBroadcastViaRpc(transaction, "backpack_sign_and_send_bug");
+        }
+
+        // Pass 14: `UseMwaSignAndSend=false` routes every other wallet through
+        // the same sign-then-RPC path Backpack uses. One wallet intent, one
+        // approval, app-side broadcast. Flag ON (default) keeps the native
+        // MWA `sign_and_send_transactions` path.
+        if (!AppConfig.UseMwaSignAndSend)
+        {
+            return await SignAndBroadcastViaRpc(transaction, "use_mwa_sign_and_send_flag_off");
         }
 
         UpdateStatus("Signing and sending transaction...");
@@ -380,16 +496,105 @@ public class MWAManager : MonoBehaviour
             else
             {
                 Debug.Log($"{TAG} SignAndSendTransaction | RESULT=RPC_FAIL reason={result.Reason} error_code={result.ServerErrorCode}");
-                UpdateStatus($"Send failed: {result.Reason}");
+                if (IsInsufficientRentError(result.Reason))
+                {
+                    LastErrorCode = "INSUFFICIENT_FUNDS_FOR_RENT";
+                    UpdateStatus($"Fee-payer underfunded — send ≥0.001 SOL to {TruncatePubkey(ConnectedPubkey)} and retry");
+                }
+                else
+                {
+                    LastErrorCode = "RPC_BROADCAST_FAILED";
+                    UpdateStatus($"Send failed: {result.Reason}");
+                }
                 return "";
             }
         }
         catch (Exception ex)
         {
             Debug.Log($"{TAG} SignAndSendTransaction | RESULT=EXCEPTION type={ex.GetType().Name} msg={ex.Message} stack={ex.StackTrace}");
+            LastErrorCode = "EXCEPTION";
             UpdateStatus($"Sign & send failed: {CategorizeError(ex)}");
             return "";
         }
+    }
+
+    // ─── SIGN + RPC BROADCAST (Backpack fallback path) ──────────────────
+    //
+    // Sign the tx via MWA `sign_transactions` (which Backpack DOES implement
+    // correctly), then broadcast to the Solana JSON-RPC endpoint ourselves.
+    // One wallet intent, one user approval, identical UX to the native
+    // sign_and_send. Used for Backpack because its native sign_and_send
+    // handler crashes.
+    private async Task<string> SignAndBroadcastViaRpc(Transaction transaction, string reason)
+    {
+        Debug.Log($"{TAG} SignAndBroadcastViaRpc | START reason={reason} blockhash={transaction.RecentBlockHash} fee_payer={transaction.FeePayer} instructions={transaction.Instructions?.Count ?? 0}");
+        UpdateStatus("Signing and sending transaction...");
+
+        try
+        {
+            // STEP 1: sign via MWA (one wallet intent)
+            Debug.Log($"{TAG} SignAndBroadcastViaRpc | STEP_1_MWA_SIGN_START");
+            var signedTx = await Web3.Wallet.SignTransaction(transaction);
+            if (signedTx == null)
+            {
+                Debug.Log($"{TAG} SignAndBroadcastViaRpc | STEP_1_FAIL signed_tx_null");
+                UpdateStatus("Sign & send failed — wallet returned no signed transaction");
+                return "";
+            }
+
+            // STEP 2: serialize for RPC
+            byte[] serialized = signedTx.Serialize();
+            string base64 = Convert.ToBase64String(serialized);
+            Debug.Log($"{TAG} SignAndBroadcastViaRpc | STEP_2_SERIALIZED raw_bytes={serialized.Length} base64_len={base64.Length}");
+
+            // STEP 3: broadcast via Solana JSON-RPC
+            Debug.Log($"{TAG} SignAndBroadcastViaRpc | STEP_3_RPC_SEND_START skipPreflight=false preflightCommitment=Confirmed");
+            var sendResult = await Web3.Rpc.SendTransactionAsync(base64, skipPreflight: false, preFlightCommitment: Commitment.Confirmed);
+            Debug.Log($"{TAG} SignAndBroadcastViaRpc | STEP_3_RPC_SEND_DONE successful={sendResult.WasSuccessful} result={sendResult.Result ?? "null"} reason={sendResult.Reason ?? "null"} error_code={sendResult.ServerErrorCode}");
+
+            if (!sendResult.WasSuccessful || string.IsNullOrEmpty(sendResult.Result))
+            {
+                if (IsInsufficientRentError(sendResult.Reason))
+                {
+                    Debug.Log($"{TAG} SignAndBroadcastViaRpc | STEP_3_RPC_SEND_FAIL INSUFFICIENT_FUNDS_FOR_RENT reason={sendResult.Reason}");
+                    LastErrorCode = "INSUFFICIENT_FUNDS_FOR_RENT";
+                    UpdateStatus($"Fee-payer underfunded — send ≥0.001 SOL to {TruncatePubkey(ConnectedPubkey)} and retry");
+                }
+                else
+                {
+                    LastErrorCode = "RPC_BROADCAST_FAILED";
+                    UpdateStatus($"RPC broadcast failed: {sendResult.Reason ?? "empty signature"}");
+                }
+                return "";
+            }
+
+            AndroidToast.Show($"Transaction sent: {sendResult.Result[..Math.Min(16, sendResult.Result.Length)]}...", longDuration: true);
+            UpdateStatus($"Sent! Sig: {sendResult.Result[..Math.Min(20, sendResult.Result.Length)]}...");
+            return sendResult.Result;
+        }
+        catch (Exception ex)
+        {
+            Debug.Log($"{TAG} SignAndBroadcastViaRpc | EXCEPTION type={ex.GetType().Name} msg={ex.Message} stack={ex.StackTrace}");
+            LastErrorCode = "EXCEPTION";
+            UpdateStatus($"Sign & send failed: {CategorizeError(ex)}");
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// Detects Solana RPC `InsufficientFundsForRent` preflight simulation
+    /// errors from a sendTransaction `Reason` string. The Solana JSON-RPC
+    /// endpoint returns code -32002 with a structured err payload
+    /// `{"InsufficientFundsForRent":{"account_index":N}}` which the Unity
+    /// SDK surfaces through `RequestResult.Reason`. Matches both the
+    /// structured err name and the plain-English version.
+    /// See KNOWN_ISSUES.md "Insufficient funds for rent".
+    /// </summary>
+    private static bool IsInsufficientRentError(string reason)
+    {
+        if (string.IsNullOrEmpty(reason)) return false;
+        return reason.IndexOf("InsufficientFundsForRent", StringComparison.Ordinal) >= 0
+            || reason.IndexOf("insufficient funds for rent", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     // ─── GET CAPABILITIES ────────────────────────────────────────────────
@@ -457,22 +662,26 @@ public class MWAManager : MonoBehaviour
         bool walletApproved = false;
         string routeReason;
 
-        if (ConnectedWalletType == WALLET_SOLFLARE)
+        // Phantom and Solflare do NOT implement `sign_messages` over MWA on
+        // Android — their `get_capabilities` feature lists omit it. Calling
+        // sign_messages hangs or drops the WebSocket. Gate delete on a
+        // throwaway memo-only `sign_transactions` call (which both DO
+        // implement) and treat a successful signature as user confirmation.
+        // The signed tx is NEVER broadcast — no lamports spent, no memo
+        // hits chain. See KNOWN_ISSUES.md "Phantom/Solflare sign_messages".
+        if (ConnectedWalletType == WALLET_PHANTOM || ConnectedWalletType == WALLET_SOLFLARE)
         {
-            // Solflare: signMessage broken on MWA — re-auth for confirmation
-            routeReason = "solflare_sign_broken";
-            Debug.Log($"{TAG} DeleteAccount | ROUTE=re-auth reason={routeReason} wallet_type={ConnectedWalletType}");
+            routeReason = ConnectedWalletType == WALLET_PHANTOM ? "phantom_no_sign_messages" : "solflare_no_sign_messages";
+            Debug.Log($"{TAG} DeleteAccount | ROUTE=sign_transactions_memo reason={routeReason} wallet_type={ConnectedWalletType}");
             try
             {
-                UpdateStatus("Approve in Solflare to confirm deletion...");
-                Web3.Instance.rpcCluster = AppConfig.SdkCluster;
-                var account = await Web3.Instance.LoginWalletAdapter();
-                walletApproved = account != null;
-                Debug.Log($"{TAG} DeleteAccount | re-auth returned account={account != null} approved={walletApproved}");
+                UpdateStatus("Confirm deletion in your wallet...");
+                walletApproved = await ConfirmDeleteViaMemoTx();
+                Debug.Log($"{TAG} DeleteAccount | memo_tx_gate returned approved={walletApproved}");
             }
             catch (Exception ex)
             {
-                Debug.Log($"{TAG} DeleteAccount | re-auth EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
+                Debug.Log($"{TAG} DeleteAccount | memo_tx_gate EXCEPTION type={ex.GetType().Name} msg={ex.Message}");
             }
         }
         else if (Web3.Wallet != null)
@@ -534,6 +743,63 @@ public class MWAManager : MonoBehaviour
         AndroidToast.Show("Account deleted — all cached data cleared", longDuration: true);
         UpdateStatus("Account deleted — all cached data cleared");
         return true;
+    }
+
+    // ─── MEMO-TX CONFIRMATION GATE (Phantom/Solflare delete) ────────────
+    //
+    // Build a throwaway memo-only transaction with ownership-proof wording
+    // and submit it through `sign_transactions`. The signature proves user
+    // consent; the signed tx is NEVER broadcast — the blockhash will
+    // harmlessly expire. No lamports spent, no memo on chain. Used ONLY by
+    // Phantom and Solflare delete flows because they don't implement
+    // `sign_messages` over MWA Android.
+    private async Task<bool> ConfirmDeleteViaMemoTx()
+    {
+        if (Web3.Wallet == null || Web3.Rpc == null)
+        {
+            Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | FAIL wallet_or_rpc_null wallet_null={Web3.Wallet == null} rpc_null={Web3.Rpc == null}");
+            return false;
+        }
+
+        Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | STEP_1_BLOCKHASH_START");
+        var blockhashResult = await Web3.Rpc.GetLatestBlockHashAsync();
+        if (!blockhashResult.WasSuccessful)
+        {
+            Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | STEP_1_BLOCKHASH_FAIL reason={blockhashResult.Reason}");
+            UpdateStatus("Delete failed — could not reach Solana RPC");
+            return false;
+        }
+        var blockhash = blockhashResult.Result.Value.Blockhash;
+        var fromPubkey = Web3.Wallet.Account.PublicKey;
+        Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | STEP_1_BLOCKHASH_OK blockhash={blockhash.Substring(0, 12)}... fee_payer={fromPubkey}");
+
+        // 16-char alphanumeric nonce; makes the memo text unique so the user
+        // sees a fresh confirmation request (not a cached preview).
+        var nonce = Guid.NewGuid().ToString("N").Substring(0, 16);
+        var memoText = $"{AppConfig.AppName}: wallet ownership proof, nonce={nonce}";
+        var memoData = System.Text.Encoding.UTF8.GetBytes(memoText);
+        var memoProgramId = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+        var memoInstruction = new TransactionInstruction
+        {
+            ProgramId = memoProgramId.KeyBytes,
+            Keys = new List<AccountMeta> { AccountMeta.Writable(fromPubkey, true) },
+            Data = memoData,
+        };
+        var tx = new Transaction
+        {
+            RecentBlockHash = blockhash,
+            FeePayer = fromPubkey,
+        };
+        tx.Add(memoInstruction);
+        Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | STEP_2_TX_BUILT memo=\"{memoText}\" memo_bytes={memoData.Length}");
+
+        Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | STEP_3_SIGN_START");
+        var signedTx = await Web3.Wallet.SignTransaction(tx);
+        Debug.Log($"{TAG} ConfirmDeleteViaMemoTx | STEP_3_SIGN_DONE signed_tx_null={signedTx == null}");
+
+        // Signature present = user approved. We intentionally skip RPC
+        // broadcast: the signature alone is proof of ownership.
+        return signedTx != null;
     }
 
     // ─── HELPERS ─────────────────────────────────────────────────────────
